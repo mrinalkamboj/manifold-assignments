@@ -1,56 +1,85 @@
 """
 ---------------------------------------------------------------------------------
-Full demo: you classify the ask, then each path uses a different tool style.
+Single ReAct loop + human-in-the-loop approval gate:
+- one agent node decides which tools to call
+- a damaged-item refund above Rs 2000 is diverted to an `approval` node
+  that calls interrupt() and pauses the graph until a human resumes it
+- approved refunds go to the tools node; rejected ones get a ToolMessage
+  so the agent can tell the user the refund was denied
 ---------------------------------------------------------------------------------
-1. `What is the status of the Order 8812, provide details. Provide more details about your refund policy.`
-2. `Courier is stuck. What is the weather in Mumbai right now?`
-3. `What is a chargeback, in one sentence?`
+1. `Order 8812 arrived damaged. I paid Rs 3000 total. Process my refund.`  -> approval needed
+2. `Courier is stuck. What is the weather in Bangalore right now?`        -> no approval
+3. `What is a chargeback, in one sentence?`                               -> no tools
 """
 
 import asyncio
 import sys
 from pathlib import Path
+from typing import Literal
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.graph import START, END, StateGraph
+from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 # llm import
-from agentic_developer_bootcamp.session_910_MCP.lessons.zero.init_llm import llm
+#from agentic_developer_bootcamp.session_910_MCP.lessons.zero.init_llm import llm
+from assignments.init_llm import llm
 
 # Entities import
-from agentic_developer_bootcamp.session_910_MCP.lessons.assignment_work.entities import Intent, State
+#from agentic_developer_bootcamp.session_910_MCP.lessons.assignment_work.entities import State
+from assignments.Payments_Desk.entities import State
 
+# Approval threshold: damaged-item refunds above this need a human
+APPROVAL_THRESHOLD = 2000
 
 # tools list (filled at runtime with the MCP tools)
 tools = []
 
-# Classify function to find the correct intent
-def classify(state: State):
-    classifier = llm.with_structured_output(Intent)
-    decision = classifier.invoke(state["messages"])
-    state["intent"] = decision.name
-    print("Intent:", decision.name)
-    return {"intent": state["intent"]}
-
-# Routing function
-def route(state: State) -> str:
-    return state["intent"]
-
-# Main Execute function to call the model with tools
+# Agent node: the LLM decides whether to answer directly or call a tool
 def execute(state: State):
     model = llm.bind_tools(tools)
     result = model.invoke(state["messages"])
-    return {
-        "messages": state["messages"] + [result],
-        "result": result.content or state.get("result", ""),
-        "intent": state["intent"]
-    }
+    # With the add_messages reducer, return only the delta
+    return {"messages": [result]}
 
-# function to return tool results to the node that asked for them
-def back_to_node(state: State) -> str:
-    return state["intent"]  
+# Router after the agent: detect refund calls that need human approval
+def route_after_agent(state: State) -> Literal["approval", "tools", "__end__"]:
+    last = state["messages"][-1]
+    if not getattr(last, "tool_calls", None):
+        return "__end__" # no tool calls -> final answer, stop
+    for tc in last.tool_calls:
+        if tc["name"] == "process_refund" and float(tc["args"].get("amount", 0)) > APPROVAL_THRESHOLD:
+            return "approval"
+    return "tools"
+
+# Human approval node: pauses the whole graph with interrupt().
+# Whoever drives the graph resumes it with Command(resume={"approved": True/False}).
+def approval(state: State):
+    last = state["messages"][-1]
+    tc = next(t for t in last.tool_calls if t["name"] == "process_refund")
+    decision = interrupt({
+        "message": "Human approval required: damaged-item refund above Rs "
+                   f"{APPROVAL_THRESHOLD}",
+        "tool": tc["name"],
+        "args": tc["args"],
+    })
+    if isinstance(decision, dict) and decision.get("approved"):
+        return Command(goto="tools") # approved -> let the tools node run it
+    # rejected -> inject a ToolMessage for EVERY pending tool call so none is
+    # left unanswered (an unanswered call breaks the next model invoke),
+    # then go back to the agent to tell the user the refund was denied
+    rejections = []
+    for c in last.tool_calls:
+        if c["name"] == "process_refund":
+            content = ("Refund REJECTED by human approver. Do not process it; "
+                       "inform the customer.")
+        else:
+            content = "Not executed: the related refund was rejected by the human approver."
+        rejections.append(ToolMessage(content=content, tool_call_id=c["id"]))
+    return Command(update={"messages": rejections}, goto="agent")
 
 # Establish a connection with the MCP server
 MCP_SERVER = str(Path(__file__).resolve().parent / "mcp_server.py") # Resolve MCP Server
@@ -64,62 +93,63 @@ mcp_client = MultiServerMCPClient({
     },
     })
 
+async def run_until_done(graph, payload, config):
+    """Stream the graph; on an interrupt, BLOCK for a human decision, then resume.
+
+    The graph truly halts here: input() waits for the approver to type y/n.
+    In a real app you would instead return the interrupt payload to the UI and
+    resume later in a separate invocation with the same thread_id.
+    """
+    while True:
+        paused = False
+        async for event in graph.astream(payload, config, stream_mode="updates"):
+            if "__interrupt__" in event:
+                intr = event["__interrupt__"][0]
+                print("PAUSED FOR APPROVAL --->", intr.value)
+                paused = True
+        if not paused:
+            break
+        # blocking input() is fine here: nothing else needs the event loop
+        answer = await asyncio.to_thread(
+            input, "Approve this refund? [y/n]: "
+        )
+        approved = answer.strip().lower() in ("y", "yes")
+        print(f"Human decision ---> {'APPROVED' if approved else 'REJECTED'}")
+        payload = Command(resume={"approved": approved})
+    return await graph.aget_state(config)
+
 async def main():
-    
+
     tools = await mcp_client.get_tools() # list of mcp tools
     print("MCP tools:", [tool.name for tool in tools]) # print mcp tools
     globals()["tools"].extend(tools) # make tools visible to execute()
-    
+
     builder = StateGraph(State) #lang graph state graph
-    builder.add_node("classify", classify) # adding classify node
-    builder.add_node("order_status", execute) # adding order status node
-    builder.add_node("weather", execute) # adding weather node
-    builder.add_node("chat", execute) # adding chat node
-    builder.add_node("refund_policy", execute) # adding chat node
+    builder.add_node("agent", execute) # adding agent node
     builder.add_node("tools", ToolNode(tools)) # adding tools node
+    builder.add_node("approval", approval) # adding human approval node
 
-    builder.add_edge(START, "classify") # adding edge from start to classify
-    
-    builder.add_conditional_edges(
-        "classify",
-        route,
-        {"order_status": "order_status", 
-         "weather": "weather", 
-         "chat": "chat",
-         "refund_policy": "refund_policy"},
-    )
-    builder.add_conditional_edges("order_status", tools_condition) # adding conditional edge from assistant to tools
-    builder.add_conditional_edges("weather", tools_condition) # adding conditional edge from assistant to tools
-    builder.add_conditional_edges("chat", tools_condition) # adding conditional edge from assistant to tools
-    builder.add_conditional_edges("refund_policy", tools_condition) # adding conditional edge from assistant to tools   
+    builder.add_edge(START, "agent") # adding edge from start to agent
+    builder.add_conditional_edges("agent", route_after_agent) # approval / tools / END
+    builder.add_edge("tools", "agent") # loop back so the agent can chain tools
+    # approval routes itself via Command (-> tools when approved, -> agent when rejected)
 
-    builder.add_conditional_edges(
-        "tools",
-        back_to_node,
-        {"order_status": "order_status",
-         "weather": "weather",
-         "chat": "chat",
-         "refund_policy": "refund_policy"},
-    )
-    
-    builder.add_edge("order_status", END)
-    builder.add_edge("weather", END)
-    builder.add_edge("chat", END)
-    builder.add_edge("refund_policy", END)
-    graph = builder.compile()
+    # interrupt() requires a checkpointer so the paused state can be saved and resumed
+    graph = builder.compile(checkpointer=MemorySaver())
 
     print(graph.get_graph().draw_ascii())
     print("--------------------------------------------------------------------------------------------------------------------------------")
 
     for question in (
-        "What is the status of the Order 8812. What is your refund policy, I have paid total Rs 3000",
+        "Order 8812 arrived damaged. I paid Rs 1000 total. Process my refund.",
         "Courier is stuck. What is the weather in Bangalore right now?",
         "What is a chargeback, in one sentence?",
     ):
-        # Call to the Agentic Framework (Lang Graph)
-        output = await graph.ainvoke({"messages": [HumanMessage(content=question)]})
+        config = {"configurable": {"thread_id": question[:40]}}
+        # halts and waits for keyboard input if a large refund needs approval
+        state = await run_until_done(graph, {"messages": [HumanMessage(content=question)]}, config)
         print(f"Question Asked ---> {question}")
-        print(f"Final Response ---> {output['result']}")
+        print(f"Final Response ---> {state.values['messages'][-1].content}")
         print("--------------------------------------------------------------------------------------------------------------------------------")
 
 # Initiate Async code

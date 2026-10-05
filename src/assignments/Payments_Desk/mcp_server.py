@@ -67,13 +67,24 @@ def check_order_status(order_id: int) -> dict:
     """
     logging.info("Calling Check Order Status Method ...")
     order_status_dict = {
-        8812: "Order 8812 is damaged, would be thus refunded",
-        8813: "Order 8813 is shipped, please wait for the delivery ",
-        8814: "Order 8814 is pending, please wait for the final status update",
-        8815: "Order 8815 is cancelled, total amount will be refunded",
+        8812: "Order 8812 is damaged",
+        8813: "Order 8813 is shipped",
+        8814: "Order 8814 is pending",
+        8815: "Order 8815 is cancelled",
     }
-    order_status = order_status_dict.get(order_id, "Order status not found, total amount will be refunded")
+    order_status = order_status_dict.get(order_id, "Order status not found")
     return {"order_status": order_status}
+
+@mcp.tool()
+def process_refund(order_id: int, amount: int, reason: str) -> str:
+    """
+    EXECUTE a refund: actually issue the refund of `amount` rupees for the given order.
+
+    Use this tool whenever the customer asks for a refund to be issued. Pass the
+    order id, the refund amount in rupees, and the reason (e.g. 'damaged item').
+    """
+    logging.info(f"Processing refund of Rs {amount} for order {order_id} ({reason}) ...")
+    return f"REFUND PROCESSED: Rs {amount} refunded to the customer for order {order_id} ({reason})."
 
 @mcp.tool()
 def get_live_weather(city: str) -> str:

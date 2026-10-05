@@ -157,3 +157,6 @@ cython_debug/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+#python scratch pad files
+scratchpad.py
